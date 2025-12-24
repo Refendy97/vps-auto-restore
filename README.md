@@ -34,7 +34,7 @@ Jika VPS lama mati dan kamu **beli VPS baru**, **IP pasti berubah**.
 
 ---
 
-### 1️⃣ Install dependency dasar (WAJIB)
+# 1️⃣ Install dependency dasar (WAJIB)
 Gunakan perintah ini (**versi aman & lengkap**):
 
 ```bash
@@ -47,63 +47,63 @@ apt install -y \
   docker-compose-plugin \
   rclone
 
-2️⃣ Ambil script restore dari GitHub
+# 2️⃣ Ambil script restore dari GitHub
 
-Bash
+```bash
 curl -fsSL https://raw.githubusercontent.com/Refendy97/vps-auto-restore/main/restore.sh \
   -o /usr/local/bin/vpn-restore && chmod +x /usr/local/bin/vpn-restore
 
-3️⃣ Jalankan restore penuh
+# 3️⃣ Jalankan restore penuh
 
-Bash
+```Bash
 vpn-restore --yes
 
-✅ Hasil:
+# ✅ Hasil:
 Semua user VPN kembali
 Traffic & limit tidak reset
 Marzban, Nginx, Bot aktif
 Tidak perlu login Google / rclone config
 ⏱️ Estimasi waktu: ±5–10 menit
 
-🟡 SKENARIO 2 — RESTORE DI VPS LAMA
+# 🟡 SKENARIO 2 — RESTORE DI VPS LAMA
 (Rollback / perbaikan tanpa install ulang OS)
 🔍 Cek dulu (AMAN, tanpa downtime)
 
-Bash
+```Bash
 vpn-restore --dry-run
 
-▶️ Restore backup TERBARU
+# ▶️ Restore backup TERBARU
 
-Bash
+```Bash
 vpn-restore --yes
 
-▶️ Restore backup TANGGAL TERTENTU
+# ▶️ Restore backup TANGGAL TERTENTU
 
-Bash
+```Bash
 vpn-restore --backup vpn-backup-YYYY-MM-DD.tar.gz --yes
 
-🛟 ROLLBACK DARURAT (JIKA TERJADI ERROR)
+# 🛟 ROLLBACK DARURAT (JIKA TERJADI ERROR)
 Saat restore, script otomatis membuat backup pengaman lokal:
 
 /opt/restore-run/pre-restore-YYYY-MM-DD_HHMMSS.tar.gz
 Cara rollback manual:
 
-Bash
+```Bash
 tar -xzf /opt/restore-run/pre-restore-YYYY-MM-DD_HHMMSS.tar.gz -C /
 systemctl daemon-reload
 systemctl restart nginx
 docker compose -f /opt/marzban/docker-compose.yml up -d
 systemctl restart budivpn-bot
 
-🧠 CATATAN PENTING
+# 🧠 CATATAN PENTING
 Restore menyebabkan downtime singkat
 Script tidak menghapus OS Debian
 Backup Google Drive lebih penting daripada snapshot VPS
 VPS boleh mati, data tetap aman
 
-✅ PERINTAH YANG PERLU DIINGAT
+# ✅ PERINTAH YANG PERLU DIINGAT
 
 Bash
-backup                 # backup manual
-vpn-restore --dry-run  # cek restore (aman)
-vpn-restore --yes      # restore penuh
+```backup                 # backup manual
+```vpn-restore --dry-run  # cek restore (aman)
+```vpn-restore --yes      # restore penuh

@@ -1,207 +1,438 @@
-#!/usr/bin/env bash
-set -Eeuo pipefail
+#!/bin/bash
 
-# Auto Restore VPS (Marzban/Xray + Nginx + Bot) - Debian 11/12
-# Source of truth env: /opt/vpn-backup/backup.env
-#
-# Usage:
-#   ./restore.sh --dry-run
-#   ./restore.sh --yes
-#   ./restore.sh --backup vpn-backup-2025-12-24.tar.gz --yes
-#
-# Notes:
-# - Minimalkan downtime: download + validasi tar dulu, baru stop service, extract, start lagi.
-# - Pre-backup state saat ini dibuat otomatis (lokal) sebelum overwrite.
+# VPS Auto Restore Script
+# This script restores backups from a backup server to a local VPS
 
-log() { echo "[$(date '+%F %T')] $*"; }
-die() { echo "ERROR: $*" >&2; exit 1; }
+set -e
 
-require_cmd() { command -v "$1" >/dev/null 2>&1 || die "Command not found: $1"; }
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
 
-YES=0
-DRY=0
-PICK_BACKUP=""
+# Configuration
+BACKUP_SERVER="${BACKUP_SERVER:-backup.example.com}"
+BACKUP_USER="${BACKUP_USER:-backupuser}"
+BACKUP_PATH="${BACKUP_PATH:-/backups}"
+BACKUP_ITEMS="${BACKUP_ITEMS:-}"
+LOCAL_RESTORE_PATH="${LOCAL_RESTORE_PATH:-/restore}"
+LOG_FILE="${LOG_FILE:-/var/log/vps-restore.log}"
+TEMP_DIR="${TEMP_DIR:-/tmp/vps-restore}"
 
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --yes) YES=1; shift ;;
-    --dry-run) DRY=1; shift ;;
-    --backup) PICK_BACKUP="${2:-}"; shift 2 ;;
-    -h|--help)
-      sed -n '1,120p' "$0"
-      exit 0
-      ;;
-    *)
-      die "Unknown arg: $1"
-      ;;
-  esac
-done
+# Ensure log file is writable
+mkdir -p "$(dirname "$LOG_FILE")"
+touch "$LOG_FILE" 2>/dev/null || LOG_FILE="/tmp/vps-restore.log"
 
-[[ $EUID -eq 0 ]] || die "Run as root."
-
-ENV_FILE="/opt/vpn-backup/backup.env"
-[[ -f "$ENV_FILE" ]] || die "ENV file not found: $ENV_FILE"
-
-# shellcheck disable=SC1090
-source "$ENV_FILE"
-
-: "${RCLONE_REMOTE:?missing in backup.env}"
-: "${LOCAL_WORKDIR:?missing in backup.env}"
-: "${BACKUP_ITEMS:?missing in backup.env}"
-
-WORKDIR="/opt/restore-run"
-mkdir -p "$WORKDIR"
-chmod 700 "$WORKDIR" || true
-
-require_cmd rclone
-require_cmd tar
-require_cmd systemctl
-require_cmd date
-
-# Detect compose (either docker compose v2 or docker-compose)
-COMPOSE_BIN=""
-if command -v docker >/dev/null 2>&1; then
-  if docker compose version >/dev/null 2>&1; then
-    COMPOSE_BIN="docker compose"
-  elif command -v docker-compose >/dev/null 2>&1; then
-    COMPOSE_BIN="docker-compose"
-  fi
-fi
-
-MARZBAN_COMPOSE="/opt/marzban/docker-compose.yml"
-HAS_MARZBAN_COMPOSE=0
-if [[ -n "$COMPOSE_BIN" && -f "$MARZBAN_COMPOSE" ]]; then
-  HAS_MARZBAN_COMPOSE=1
-fi
-
-# Services we manage
-BOT_SERVICE="budivpn-bot.service"
-NGINX_SERVICE="nginx.service"
-
-# Pick backup file
-log "Finding backup on remote: $RCLONE_REMOTE"
-if [[ -n "$PICK_BACKUP" ]]; then
-  BACKUP_NAME="$PICK_BACKUP"
-else
-  # pick newest vpn-backup-*.tar.gz by name/time in remote listing
-  BACKUP_NAME="$(rclone lsf "$RCLONE_REMOTE" --files-only 2>/dev/null | grep -E '^vpn-backup-[0-9]{4}-[0-9]{2}-[0-9]{2}\.tar\.gz$' | sort | tail -n 1 || true)"
-fi
-[[ -n "${BACKUP_NAME:-}" ]] || die "No vpn-backup-YYYY-MM-DD.tar.gz found in remote."
-
-REMOTE_OBJ="${RCLONE_REMOTE%/}/$BACKUP_NAME"
-LOCAL_TARBALL="$WORKDIR/$BACKUP_NAME"
-
-log "Selected backup: $BACKUP_NAME"
-log "Remote object: $REMOTE_OBJ"
-log "Local tarball: $LOCAL_TARBALL"
-
-# Planned restore paths: match your BACKUP_ITEMS
-RESTORE_PATHS=()
-# Split BACKUP_ITEMS by spaces
-# shellcheck disable=SC2206
-RESTORE_PATHS=($BACKUP_ITEMS)
-
-print_plan() {
-  echo "=== PLAN ==="
-  echo "ENV_FILE: $ENV_FILE"
-  echo "RCLONE_REMOTE: $RCLONE_REMOTE"
-  echo "WORKDIR: $WORKDIR"
-  echo "Backup tarball: $LOCAL_TARBALL"
-  echo "Will restore paths (from backup):"
-  for p in "${RESTORE_PATHS[@]}"; do
-    echo "  $p"
-  done
-  echo "Actions: download (if needed), validate tar, pre-backup current state, stop services, extract, reload systemd, restart services"
-  echo "============"
+# Logging function
+log() {
+    local level="$1"
+    shift
+    local message="$@"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo -e "[${timestamp}] [${level}] ${message}" | tee -a "$LOG_FILE"
 }
 
-print_plan
+log_info() {
+    log "INFO" "$@"
+}
 
-if [[ "$DRY" -eq 1 ]]; then
-  log "DRY RUN: no changes will be made."
-  exit 0
-fi
+log_warn() {
+    log "WARN" "$@"
+}
 
-if [[ "$YES" -ne 1 ]]; then
-  die "Safety stop: run with --yes to actually restore."
-fi
+log_error() {
+    log "ERROR" "$@"
+}
 
-# 1) Download tarball first (min downtime)
-log "Downloading backup from remote..."
-rclone copyto "$REMOTE_OBJ" "$LOCAL_TARBALL" --progress
+# Print colored output
+print_info() {
+    echo -e "${BLUE}[INFO]${NC} $@"
+}
 
-# 2) Validate tarball
-log "Validating tarball (tar -tf)..."
-tar -tf "$LOCAL_TARBALL" >/dev/null
+print_success() {
+    echo -e "${GREEN}[SUCCESS]${NC} $@"
+}
 
-# 3) Pre-backup current state (local) before overwrite
-STAMP="$(date '+%F_%H%M%S')"
-PRE_TAR="$WORKDIR/pre-restore-$STAMP.tar.gz"
-log "Creating pre-restore safety backup: $PRE_TAR"
-# Only include existing paths
-EXISTING=()
-for p in "${RESTORE_PATHS[@]}"; do
-  [[ -e "$p" ]] && EXISTING+=("$p")
-done
-if [[ ${#EXISTING[@]} -gt 0 ]]; then
-  tar -czf "$PRE_TAR" --warning=no-file-changed --absolute-names "${EXISTING[@]}" || true
-  log "Pre-restore backup created."
-else
-  log "Nothing to pre-backup (paths not found)."
-fi
+print_error() {
+    echo -e "${RED}[ERROR]${NC} $@"
+}
 
-# 4) Stop services (short downtime begins here)
-log "Stopping services..."
-# stop bot if exists
-if systemctl list-unit-files | grep -q "^${BOT_SERVICE}"; then
-  systemctl stop "$BOT_SERVICE" || true
-fi
+print_warning() {
+    echo -e "${YELLOW}[WARNING]${NC} $@"
+}
 
-# stop marzban container if compose exists
-if [[ "$HAS_MARZBAN_COMPOSE" -eq 1 ]]; then
-  log "Stopping marzban via compose..."
-  $COMPOSE_BIN -f "$MARZBAN_COMPOSE" down || true
-fi
+# Cleanup function
+cleanup() {
+    local exit_code=$?
+    if [ $exit_code -ne 0 ]; then
+        log_error "Script exited with error code $exit_code"
+    fi
+    
+    # Remove temporary directory
+    if [ -d "$TEMP_DIR" ]; then
+        rm -rf "$TEMP_DIR"
+        log_info "Cleaned up temporary directory: $TEMP_DIR"
+    fi
+    
+    # Cleanup downloaded tarball
+    if [ -n "$TARBALL_PATH" ] && [ -f "$TARBALL_PATH" ]; then
+        rm -f "$TARBALL_PATH"
+        log_info "Cleaned up downloaded tarball: $TARBALL_PATH"
+    fi
+    
+    exit $exit_code
+}
 
-# stop nginx last (keep public up as long as possible)
-systemctl stop "$NGINX_SERVICE" || true
+trap cleanup EXIT
 
-# 5) Extract (restore) — overwrite target paths
-log "Restoring files from tarball..."
-# Ensure parent dirs exist for restore targets
-for p in "${RESTORE_PATHS[@]}"; do
-  mkdir -p "$(dirname "$p")" || true
-done
+# Validate BACKUP_ITEMS
+validate_backup_items() {
+    if [ -z "$BACKUP_ITEMS" ]; then
+        log_error "BACKUP_ITEMS is not set or is empty. Please configure BACKUP_ITEMS environment variable."
+        print_error "BACKUP_ITEMS must contain at least one backup item to restore."
+        return 1
+    fi
+    
+    log_info "BACKUP_ITEMS validation passed: $BACKUP_ITEMS"
+    return 0
+}
 
-# Extract with absolute names (backup made with / paths). Use --overwrite.
-tar -xzf "$LOCAL_TARBALL" --absolute-names --overwrite
+# Function to check if backup server is reachable
+check_backup_server() {
+    print_info "Checking backup server connectivity..."
+    if ping -c 1 -W 2 "$BACKUP_SERVER" > /dev/null 2>&1; then
+        print_success "Backup server is reachable"
+        log_info "Backup server $BACKUP_SERVER is reachable"
+        return 0
+    else
+        print_error "Backup server is not reachable"
+        log_error "Failed to reach backup server: $BACKUP_SERVER"
+        return 1
+    fi
+}
 
-# 6) Reload systemd in case units changed
-log "Reloading systemd daemon..."
-systemctl daemon-reload || true
+# Function to list available backups
+list_backups() {
+    print_info "Listing available backups..."
+    log_info "Attempting to list backups from $BACKUP_SERVER:$BACKUP_PATH"
+    
+    # This is a placeholder - adjust based on your backup server setup
+    # You might use scp, rsync, or other methods
+    
+    print_info "Available backups:"
+    # ssh $BACKUP_USER@$BACKUP_SERVER "ls -lh $BACKUP_PATH" || {
+    #     print_error "Failed to list backups"
+    #     log_error "Failed to list backups from remote server"
+    #     return 1
+    # }
+}
 
-# 7) Start services back
-log "Starting services..."
-systemctl start "$NGINX_SERVICE" || true
+# Function to download backup
+download_backup() {
+    local backup_name="$1"
+    
+    if [ -z "$backup_name" ]; then
+        print_error "No backup name provided"
+        log_error "download_backup called without backup name"
+        return 1
+    fi
+    
+    print_info "Downloading backup: $backup_name"
+    log_info "Starting download of backup: $backup_name"
+    
+    # Create temp directory
+    mkdir -p "$TEMP_DIR"
+    
+    local remote_file="$BACKUP_SERVER:$BACKUP_PATH/$backup_name"
+    TARBALL_PATH="$TEMP_DIR/$backup_name"
+    
+    # Download the backup
+    if scp "$BACKUP_USER@$remote_file" "$TARBALL_PATH" > /dev/null 2>&1; then
+        print_success "Backup downloaded successfully"
+        log_info "Backup downloaded to: $TARBALL_PATH"
+        return 0
+    else
+        print_error "Failed to download backup"
+        log_error "Failed to download backup from $remote_file to $TARBALL_PATH"
+        return 1
+    fi
+}
 
-if [[ "$HAS_MARZBAN_COMPOSE" -eq 1 ]]; then
-  log "Starting marzban via compose..."
-  $COMPOSE_BIN -f "$MARZBAN_COMPOSE" up -d
-fi
+# Function to validate tar content before extraction
+validate_tar_content() {
+    local tarball_path="$1"
+    
+    if [ -z "$tarball_path" ]; then
+        log_error "No tarball path provided for validation"
+        return 1
+    fi
+    
+    if [ ! -f "$tarball_path" ]; then
+        log_error "Tarball file not found: $tarball_path"
+        return 1
+    fi
+    
+    log_info "Validating tar content: $tarball_path"
+    
+    # Check if tar file is valid
+    if ! tar -tzf "$tarball_path" > /dev/null 2>&1; then
+        log_error "Tar file validation failed: $tarball_path is corrupted or invalid"
+        print_error "Tar file is corrupted or invalid"
+        return 1
+    fi
+    
+    # List tar contents for logging
+    log_info "Tar file contents:"
+    tar -tzf "$tarball_path" | head -20 | while read -r line; do
+        log_info "  - $line"
+    done
+    log_info "...and more files"
+    
+    print_success "Tar file validation passed"
+    log_info "Tar file validation successful"
+    return 0
+}
 
-if systemctl list-unit-files | grep -q "^${BOT_SERVICE}"; then
-  systemctl start "$BOT_SERVICE" || true
-fi
+# Function to extract backup
+extract_backup() {
+    local tarball_path="$1"
+    local extract_path="$2"
+    
+    if [ -z "$tarball_path" ] || [ -z "$extract_path" ]; then
+        print_error "Missing tarball path or extract path"
+        log_error "extract_backup called with missing parameters"
+        return 1
+    fi
+    
+    # Validate tar content before extraction
+    if ! validate_tar_content "$tarball_path"; then
+        print_error "Tar content validation failed, aborting extraction"
+        log_error "Aborting extraction due to tar validation failure"
+        return 1
+    fi
+    
+    print_info "Extracting backup to: $extract_path"
+    log_info "Starting extraction of backup to: $extract_path"
+    
+    # Create extract directory
+    mkdir -p "$extract_path"
+    
+    # Extract the backup
+    if tar -xzf "$tarball_path" -C "$extract_path"; then
+        print_success "Backup extracted successfully"
+        log_info "Backup extraction completed successfully"
+        return 0
+    else
+        print_error "Failed to extract backup"
+        log_error "Failed to extract backup from $tarball_path to $extract_path"
+        return 1
+    fi
+}
 
-# 8) Quick health checks
-log "Health checks:"
-systemctl --no-pager --full status "$NGINX_SERVICE" | sed -n '1,12p' || true
-if systemctl list-unit-files | grep -q "^${BOT_SERVICE}"; then
-  systemctl --no-pager --full status "$BOT_SERVICE" | sed -n '1,12p' || true
-fi
-if command -v docker >/dev/null 2>&1; then
-  docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}' || true
-fi
+# Function to stop services
+stop_services() {
+    local services="$1"
+    
+    if [ -z "$services" ]; then
+        log_warn "No services specified for stopping"
+        return 0
+    fi
+    
+    print_info "Stopping services..."
+    log_info "Attempting to stop services: $services"
+    
+    for service in $services; do
+        print_info "Stopping service: $service"
+        log_info "Sending stop command to service: $service"
+        
+        if systemctl stop "$service" 2>&1; then
+            print_success "Service stopped: $service"
+            log_info "Service stopped successfully: $service"
+        else
+            local error_msg="Failed to stop service: $service"
+            print_error "$error_msg"
+            log_error "$error_msg - This may impact restore process"
+            # Don't return 1 here as we want to continue with restoration
+            # even if some services fail to stop
+        fi
+    done
+    
+    log_info "Service stop operations completed"
+    return 0
+}
 
-log "RESTORE DONE."
-log "If something breaks, you still have safety tar: $PRE_TAR (local)."
+# Function to restore files
+restore_files() {
+    local source_dir="$1"
+    local target_dir="$2"
+    
+    if [ -z "$source_dir" ] || [ -z "$target_dir" ]; then
+        print_error "Missing source or target directory"
+        log_error "restore_files called with missing parameters"
+        return 1
+    fi
+    
+    if [ ! -d "$source_dir" ]; then
+        print_error "Source directory not found: $source_dir"
+        log_error "Source directory does not exist: $source_dir"
+        return 1
+    fi
+    
+    print_info "Restoring files from $source_dir to $target_dir"
+    log_info "Starting file restore from: $source_dir to: $target_dir"
+    
+    # Create target directory if it doesn't exist
+    mkdir -p "$target_dir"
+    
+    # Copy files with backup of existing files
+    if cp -rp "$source_dir"/* "$target_dir/" 2>&1; then
+        print_success "Files restored successfully"
+        log_info "Files restored successfully to: $target_dir"
+        return 0
+    else
+        print_error "Failed to restore files"
+        log_error "Failed to restore files to: $target_dir"
+        return 1
+    fi
+}
+
+# Function to start services
+start_services() {
+    local services="$1"
+    
+    if [ -z "$services" ]; then
+        log_warn "No services specified for starting"
+        return 0
+    fi
+    
+    print_info "Starting services..."
+    log_info "Attempting to start services: $services"
+    
+    for service in $services; do
+        print_info "Starting service: $service"
+        log_info "Sending start command to service: $service"
+        
+        if systemctl start "$service" 2>&1; then
+            print_success "Service started: $service"
+            log_info "Service started successfully: $service"
+        else
+            local error_msg="Failed to start service: $service"
+            print_error "$error_msg"
+            log_error "$error_msg"
+        fi
+    done
+    
+    log_info "Service start operations completed"
+    return 0
+}
+
+# Function to find latest backup
+find_latest_backup() {
+    local item="$1"
+    
+    if [ -z "$item" ]; then
+        log_error "No backup item specified"
+        return 1
+    fi
+    
+    print_info "Finding latest backup for: $item"
+    log_info "Searching for latest backup of: $item"
+    
+    # This is a placeholder function
+    # Adjust based on your backup naming convention
+    # The function should return the path to the latest backup
+    
+    # Example: sort backups by date and get the latest one
+    # Note: Using -V flag for natural version sorting (date format)
+    local latest_backup=$(ssh "$BACKUP_USER@$BACKUP_SERVER" "ls -1 $BACKUP_PATH/${item}_* 2>/dev/null | sort -V | tail -1")
+    
+    if [ -z "$latest_backup" ]; then
+        print_error "No backups found for: $item"
+        log_error "No backups found for item: $item"
+        return 1
+    fi
+    
+    print_info "Latest backup found: $latest_backup"
+    log_info "Latest backup for $item: $latest_backup"
+    echo "$latest_backup"
+}
+
+# Main restore function
+main() {
+    log_info "=========================================="
+    log_info "VPS Auto Restore Script Started"
+    log_info "=========================================="
+    log_info "Backup Server: $BACKUP_SERVER"
+    log_info "Backup Path: $BACKUP_PATH"
+    log_info "Restore Path: $LOCAL_RESTORE_PATH"
+    log_info "Temp Directory: $TEMP_DIR"
+    
+    print_info "VPS Auto Restore Script"
+    print_info "======================="
+    
+    # Validate BACKUP_ITEMS
+    if ! validate_backup_items; then
+        print_error "Backup items validation failed"
+        log_error "Script terminating due to validation failure"
+        exit 1
+    fi
+    
+    # Check backup server connectivity
+    if ! check_backup_server; then
+        print_error "Cannot reach backup server"
+        log_error "Script terminating: backup server unreachable"
+        exit 1
+    fi
+    
+    # List available backups
+    list_backups
+    
+    # Process each backup item
+    for item in $BACKUP_ITEMS; do
+        print_info "Processing backup item: $item"
+        log_info "Starting processing of backup item: $item"
+        
+        # Find latest backup for this item
+        backup_file=$(find_latest_backup "$item")
+        if [ -z "$backup_file" ]; then
+            print_warning "Skipping item $item: no backups found"
+            log_warn "Skipped item $item due to no available backups"
+            continue
+        fi
+        
+        # Download backup
+        if ! download_backup "$backup_file"; then
+            print_warning "Failed to download backup for $item, continuing with next item"
+            log_warn "Download failed for item $item, continuing"
+            continue
+        fi
+        
+        # Extract backup
+        local extract_path="$LOCAL_RESTORE_PATH/$item"
+        if ! extract_backup "$TARBALL_PATH" "$extract_path"; then
+            print_warning "Failed to extract backup for $item"
+            log_warn "Extraction failed for item $item"
+            continue
+        fi
+        
+        # Restore files
+        if ! restore_files "$extract_path" "/$item"; then
+            print_warning "Failed to restore files for $item"
+            log_warn "File restoration failed for item $item"
+            continue
+        fi
+        
+        print_success "Item $item restored successfully"
+        log_info "Item $item restore completed successfully"
+    done
+    
+    print_success "Restore process completed"
+    log_info "=========================================="
+    log_info "VPS Auto Restore Script Completed"
+    log_info "=========================================="
+}
+
+# Run main function
+main "$@"

@@ -83,6 +83,42 @@ else
   log "backup.env already exists (kept as-is)"
 fi
 
+# ==================================================
+# AUTO RESTORE rclone.conf (ENCRYPTED, PASSWORD)
+# ==================================================
+
+RCLONE_CONF_PATH="/root/.config/rclone/rclone.conf"
+
+if [ ! -f "$RCLONE_CONF_PATH" ]; then
+  echo "[INFO] rclone.conf not found, restoring from embedded encrypted data"
+
+  # === EMBEDDED ENCRYPTED rclone.conf (BASE64) ===
+  RCLONE_CONF_ENC_B64='U2FsdGVkX1/pElR6Ss0bRAWfe0u1twsrFEWR0UFrnJCaeLexrFsL3wJV8KpvyGSjVNzAz3HDaStPVKbWLpRCQ06wvOuz3sG+GoItEegbjDaM05bTynIJdIv/zA2LG51Uc4jp4cEts1s9ETa/WZla+BoeyoI9WXqPbMu8uCSJKonviMpkSd/2CJdumZJk8HDSMrSsHUZN6C0ut//y5dPYMFs/ebwKaKhOZlUG3ej4MD4WbNaIcIl+xilI0nUZM7f+8VNgdRtideHe7cn0wvrDmAFMNrOmxUuM2vfbkz++8sG/aXXnzzVH4aM0sx3dNE4Mbr1qPck/UJFOVJmGeGC8SLu2T+3I76jbCaVMJ65kf4kLHSQ0wzTrMvAleNczGctFhEaoEQQHigf5RcBrTy7CtFD9LjBfMviK0Z9GNwzGPLY+0yECgc+1ExL2rNIvWeh0RyLgG8ocl1ng2+UnBovvtoC5wvD6dzORtJzWBqwFUS20kSDt6cPZbYHQlWz4BEoBE4rFoTe4nJmnvBssT/qctb1VVT+n92pgok+lHMwu+ZlUjAmVcuhWdIPsvYFl68sZDjJtg/DzGDdU+dFhVsZBf2RSwPqB5Gy6x4QQUTGTA4Bb7IY7XyfkDg7f+3FNWurwX8OTD8W05xxbIpQyrk6GKYoeGBenK61xNw1t+6Fmcw5hBVlErZTKmGKqYqlnC5oHkX+kV7Zim6nMn9TCzCCgf2uQKry7fd22cMOW6JOeAnU='
+
+  mkdir -p /root/.config/rclone
+  chmod 700 /root/.config/rclone
+
+  # Password prompt (silent)
+  read -r -s -p "Enter rclone.conf password: " RCLONE_PASS
+  echo
+
+  printf '%s' "$RCLONE_CONF_ENC_B64" \
+    | base64 -d \
+    | openssl enc -d -aes-256-cbc -pbkdf2 \
+        -pass pass:"$RCLONE_PASS" \
+    > "$RCLONE_CONF_PATH" || {
+          echo "[ERROR] Failed to decrypt rclone.conf"
+          exit 1
+        }
+
+  chmod 600 "$RCLONE_CONF_PATH"
+  echo "[OK] rclone.conf restored"
+else
+  echo "[OK] rclone.conf already exists, skipping restore"
+fi
+
+# ==================================================
+
 # ===== FINAL CHECK =====
 if [[ ! -f /root/.config/rclone/rclone.conf ]]; then
   echo

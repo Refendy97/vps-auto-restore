@@ -1,333 +1,184 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -Eeuo pipefail
 
-################################################################################
-# VPS Auto Restore Script
-# 
-# This script automates the restoration of VPS backups
-# Features:
-# - Automatic backup detection and restoration
-# - Service management (stop/start)
-# - Data integrity validation
-# - Comprehensive logging
-# - Error handling and cleanup
+# Auto Restore VPS (Marzban/Xray + Nginx + Bot) - Debian 11/12
+# Source of truth env: /opt/vpn-backup/backup.env
 #
-# Usage: ./restore.sh [BACKUP_DATE]
-# Example: ./restore.sh 2024-01-15
-################################################################################
+# Usage:
+#   ./restore.sh --dry-run
+#   ./restore.sh --yes
+#   ./restore.sh --backup vpn-backup-YYYY-MM-DD.tar.gz --yes
 
-set -euo pipefail
+log(){ echo "[$(date '+%F %T')] $*"; }
+die(){ echo "ERROR: $*" >&2; exit 1; }
+require_cmd(){ command -v "$1" >/dev/null 2>&1 || die "Command not found: $1"; }
 
-# Configuration
-BACKUP_DIR="${BACKUP_DIR:-.}"
-RESTORE_DIR="${RESTORE_DIR:-.}"
-LOG_DIR="${LOG_DIR:-.logs}"
-TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M:%S")
-LOG_FILE="${LOG_DIR}/restore_${TIMESTAMP// /_}.log"
+YES=0
+DRY=0
+PICK_BACKUP=""
 
-# Backup items to restore
-BACKUP_ITEMS=(
-    "home"
-    "etc"
-    "var"
-)
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --yes) YES=1; shift ;;
+    --dry-run) DRY=1; shift ;;
+    --backup) PICK_BACKUP="${2:-}"; shift 2 ;;
+    -h|--help)
+      sed -n '1,120p' "$0"
+      exit 0
+      ;;
+    *) die "Unknown arg: $1" ;;
+  esac
+done
 
-# Services to stop during restore
-SERVICES_TO_STOP=(
-    "nginx"
-    "mysql"
-    "php-fpm"
-)
+[[ $EUID -eq 0 ]] || die "Run as root."
 
-################################################################################
-# Logging Functions
-################################################################################
+ENV_FILE="/opt/vpn-backup/backup.env"
+[[ -f "$ENV_FILE" ]] || die "ENV file not found: $ENV_FILE"
 
-# Initialize log directory
-mkdir -p "${LOG_DIR}"
+# shellcheck disable=SC1090
+source "$ENV_FILE"
+: "${RCLONE_REMOTE:?missing in backup.env}"
+: "${LOCAL_WORKDIR:?missing in backup.env}"
+: "${BACKUP_ITEMS:?missing in backup.env}"
 
-log_info() {
-    local message="$1"
-    echo "[$(date -u '+%Y-%m-%d %H:%M:%S')] [INFO] $message" | tee -a "${LOG_FILE}"
+WORKDIR="/opt/restore-run"
+mkdir -p "$WORKDIR"
+chmod 700 "$WORKDIR" || true
+
+require_cmd rclone
+require_cmd tar
+require_cmd systemctl
+require_cmd date
+
+# Detect compose (docker compose v2 or docker-compose)
+COMPOSE_BIN=""
+if command -v docker >/dev/null 2>&1; then
+  if docker compose version >/dev/null 2>&1; then
+    COMPOSE_BIN="docker compose"
+  elif command -v docker-compose >/dev/null 2>&1; then
+    COMPOSE_BIN="docker-compose"
+  fi
+fi
+
+MARZBAN_COMPOSE="/opt/marzban/docker-compose.yml"
+HAS_MARZBAN_COMPOSE=0
+if [[ -n "$COMPOSE_BIN" && -f "$MARZBAN_COMPOSE" ]]; then
+  HAS_MARZBAN_COMPOSE=1
+fi
+
+BOT_SERVICE="budivpn-bot.service"
+NGINX_SERVICE="nginx.service"
+
+log "Finding backup on remote: $RCLONE_REMOTE"
+
+if [[ -n "$PICK_BACKUP" ]]; then
+  BACKUP_NAME="$PICK_BACKUP"
+else
+  BACKUP_NAME="$(rclone lsf "$RCLONE_REMOTE" --files-only 2>/dev/null \
+    | grep -E '^vpn-backup-[0-9]{4}-[0-9]{2}-[0-9]{2}\.tar\.gz$' \
+    | sort | tail -n 1 || true)"
+fi
+
+[[ -n "${BACKUP_NAME:-}" ]] || die "No vpn-backup-YYYY-MM-DD.tar.gz found in remote."
+
+REMOTE_OBJ="${RCLONE_REMOTE%/}/$BACKUP_NAME"
+LOCAL_TARBALL="$WORKDIR/$BACKUP_NAME"
+
+# Restore paths = BACKUP_ITEMS (space-separated)
+# shellcheck disable=SC2206
+RESTORE_PATHS=($BACKUP_ITEMS)
+
+print_plan() {
+  echo "=== PLAN ==="
+  echo "ENV_FILE: $ENV_FILE"
+  echo "RCLONE_REMOTE: $RCLONE_REMOTE"
+  echo "WORKDIR: $WORKDIR"
+  echo "Backup tarball: $LOCAL_TARBALL"
+  echo "Will restore paths (from backup):"
+  for p in "${RESTORE_PATHS[@]}"; do echo "  $p"; done
+  echo "Actions: download, validate tar, pre-backup current state, stop services, extract, reload systemd, restart services"
+  echo "============"
 }
 
-log_error() {
-    local message="$1"
-    echo "[$(date -u '+%Y-%m-%d %H:%M:%S')] [ERROR] $message" | tee -a "${LOG_FILE}" >&2
-}
+log "Selected backup: $BACKUP_NAME"
+log "Remote object: $REMOTE_OBJ"
+log "Local tarball: $LOCAL_TARBALL"
+print_plan
 
-log_warn() {
-    local message="$1"
-    echo "[$(date -u '+%Y-%m-%d %H:%M:%S')] [WARN] $message" | tee -a "${LOG_FILE}"
-}
+if [[ "$DRY" -eq 1 ]]; then
+  log "DRY RUN: no changes will be made."
+  exit 0
+fi
 
-################################################################################
-# Validation Functions
-################################################################################
+[[ "$YES" -eq 1 ]] || die "Safety stop: run with --yes to actually restore."
 
-# Validate BACKUP_ITEMS array
-validate_backup_items() {
-    log_info "Validating backup items configuration..."
-    
-    if [[ ${#BACKUP_ITEMS[@]} -eq 0 ]]; then
-        log_error "BACKUP_ITEMS array is empty. No items to restore."
-        return 1
-    fi
-    
-    for item in "${BACKUP_ITEMS[@]}"; do
-        if [[ -z "$item" ]]; then
-            log_error "Found empty item in BACKUP_ITEMS array."
-            return 1
-        fi
-    done
-    
-    log_info "Backup items validation passed. Items: ${BACKUP_ITEMS[*]}"
-    return 0
-}
+# 1) Download first (min downtime)
+log "Downloading backup from remote..."
+rclone copyto "$REMOTE_OBJ" "$LOCAL_TARBALL" --progress
 
-# Validate backup directory exists
-validate_backup_dir() {
-    log_info "Validating backup directory..."
-    
-    if [[ ! -d "${BACKUP_DIR}" ]]; then
-        log_error "Backup directory does not exist: ${BACKUP_DIR}"
-        return 1
-    fi
-    
-    log_info "Backup directory validated: ${BACKUP_DIR}"
-    return 0
-}
+# 2) Validate tarball
+log "Validating tarball (tar -tf)..."
+tar -tf "$LOCAL_TARBALL" >/dev/null
 
-# Validate tar archive content
-validate_tar_content() {
-    local tarfile="$1"
-    
-    log_info "Validating tar archive content: ${tarfile}"
-    
-    if [[ ! -f "${tarfile}" ]]; then
-        log_error "Tar file not found: ${tarfile}"
-        return 1
-    fi
-    
-    # Test tar file integrity
-    if ! tar -tzf "${tarfile}" > /dev/null 2>&1; then
-        log_error "Tar file is corrupted or invalid: ${tarfile}"
-        return 1
-    fi
-    
-    # Check if tar file contains expected items
-    local expected_count=${#BACKUP_ITEMS[@]}
-    local found_count=0
-    
-    for item in "${BACKUP_ITEMS[@]}"; do
-        if tar -tzf "${tarfile}" | grep -q "^${item}/" || tar -tzf "${tarfile}" | grep -q "^${item}$"; then
-            ((found_count++))
-            log_info "Found expected item in archive: ${item}"
-        else
-            log_warn "Expected item not found in archive: ${item}"
-        fi
-    done
-    
-    if [[ ${found_count} -eq 0 ]]; then
-        log_error "No expected backup items found in tar archive"
-        return 1
-    fi
-    
-    log_info "Tar archive validation passed (found ${found_count}/${expected_count} expected items)"
-    return 0
-}
+# 3) Pre-restore safety backup (local)
+STAMP="$(date '+%F_%H%M%S')"
+PRE_TAR="$WORKDIR/pre-restore-$STAMP.tar.gz"
+log "Creating pre-restore safety backup: $PRE_TAR"
+EXISTING=()
+for p in "${RESTORE_PATHS[@]}"; do
+  [[ -e "$p" ]] && EXISTING+=("$p")
+done
 
-################################################################################
-# Service Management Functions
-################################################################################
+if [[ ${#EXISTING[@]} -gt 0 ]]; then
+  tar -czf "$PRE_TAR" --warning=no-file-changed --absolute-names "${EXISTING[@]}" || true
+  log "Pre-restore backup created."
+else
+  log "Nothing to pre-backup (paths not found)."
+fi
 
-# Stop services gracefully
-stop_services() {
-    log_info "Stopping services..."
-    
-    for service in "${SERVICES_TO_STOP[@]}"; do
-        if systemctl is-active --quiet "${service}" 2>/dev/null; then
-            log_info "Stopping service: ${service}"
-            if systemctl stop "${service}" 2>/dev/null; then
-                log_info "Successfully stopped service: ${service}"
-            else
-                log_error "Failed to stop service: ${service}. Continuing anyway."
-            fi
-        else
-            log_info "Service is not running or does not exist: ${service}"
-        fi
-    done
-    
-    log_info "Service stop operations completed"
-}
+# 4) Stop services (downtime starts)
+log "Stopping services..."
+if systemctl list-unit-files 2>/dev/null | grep -q "^${BOT_SERVICE}"; then
+  systemctl stop "$BOT_SERVICE" || true
+fi
 
-# Start services
-start_services() {
-    log_info "Starting services..."
-    
-    for service in "${SERVICES_TO_STOP[@]}"; do
-        if systemctl is-enabled --quiet "${service}" 2>/dev/null; then
-            log_info "Starting service: ${service}"
-            if systemctl start "${service}" 2>/dev/null; then
-                log_info "Successfully started service: ${service}"
-            else
-                log_error "Failed to start service: ${service}"
-            fi
-        fi
-    done
-    
-    log_info "Service start operations completed"
-}
+if [[ "$HAS_MARZBAN_COMPOSE" -eq 1 ]]; then
+  log "Stopping marzban via compose..."
+  $COMPOSE_BIN -f "$MARZBAN_COMPOSE" down || true
+fi
 
-################################################################################
-# Backup Selection Functions
-################################################################################
+systemctl stop "$NGINX_SERVICE" || true
 
-# Find latest backup if no date specified
-find_latest_backup() {
-    log_info "Finding latest backup..."
-    
-    # Sort backups by date using -V flag for version sort (handles dates correctly)
-    local latest_backup=$(find "${BACKUP_DIR}" -maxdepth 1 -name "*.tar.gz" -type f | \
-                         sort -V | tail -1)
-    
-    if [[ -z "${latest_backup}" ]]; then
-        log_error "No backup files found in ${BACKUP_DIR}"
-        return 1
-    fi
-    
-    log_info "Latest backup found: ${latest_backup}"
-    echo "${latest_backup}"
-    return 0
-}
+# 5) Extract restore
+log "Restoring files from tarball..."
+tar -xzf "$LOCAL_TARBALL" --absolute-names --overwrite
 
-# Find backup by date
-find_backup_by_date() {
-    local backup_date="$1"
-    log_info "Searching for backup from date: ${backup_date}"
-    
-    # Search for backup matching the date pattern
-    local backups=$(find "${BACKUP_DIR}" -maxdepth 1 -name "*${backup_date}*.tar.gz" -type f)
-    
-    if [[ -z "${backups}" ]]; then
-        log_error "No backup found for date: ${backup_date}"
-        return 1
-    fi
-    
-    # If multiple backups found, get the latest one
-    local latest_backup=$(echo "${backups}" | sort -V | tail -1)
-    
-    log_info "Backup found for date ${backup_date}: ${latest_backup}"
-    echo "${latest_backup}"
-    return 0
-}
+# 6) Reload systemd
+log "Reloading systemd daemon..."
+systemctl daemon-reload || true
 
-################################################################################
-# Restore Functions
-################################################################################
+# 7) Start services
+log "Starting services..."
+systemctl start "$NGINX_SERVICE" || true
 
-# Extract backup
-extract_backup() {
-    local tarfile="$1"
-    
-    log_info "Extracting backup from: ${tarfile}"
-    
-    if [[ ! -f "${tarfile}" ]]; then
-        log_error "Backup file not found: ${tarfile}"
-        return 1
-    fi
-    
-    if ! tar -xzf "${tarfile}" -C "${RESTORE_DIR}"; then
-        log_error "Failed to extract backup: ${tarfile}"
-        return 1
-    fi
-    
-    log_info "Backup extracted successfully to: ${RESTORE_DIR}"
-    return 0
-}
+if [[ "$HAS_MARZBAN_COMPOSE" -eq 1 ]]; then
+  log "Starting marzban via compose..."
+  $COMPOSE_BIN -f "$MARZBAN_COMPOSE" up -d
+fi
 
-# Cleanup tarball after successful restore
-cleanup_tarball() {
-    local tarfile="$1"
-    
-    if [[ -z "${tarfile}" ]] || [[ ! -f "${tarfile}" ]]; then
-        log_warn "Tarball cleanup requested but file not found: ${tarfile}"
-        return 0
-    fi
-    
-    log_info "Cleaning up temporary tarball: ${tarfile}"
-    
-    if rm -f "${tarfile}"; then
-        log_info "Tarball cleaned up successfully"
-        return 0
-    else
-        log_error "Failed to cleanup tarball: ${tarfile}"
-        return 1
-    fi
-}
+if systemctl list-unit-files 2>/dev/null | grep -q "^${BOT_SERVICE}"; then
+  systemctl start "$BOT_SERVICE" || true
+fi
 
-################################################################################
-# Main Restore Function
-################################################################################
+# 8) Quick health checks
+log "Health checks:"
+systemctl --no-pager --full status "$NGINX_SERVICE" | sed -n '1,14p' || true
+if systemctl list-unit-files 2>/dev/null | grep -q "^${BOT_SERVICE}"; then
+  systemctl --no-pager --full status "$BOT_SERVICE" | sed -n '1,14p' || true
+fi
+if command -v docker >/dev/null 2>&1; then
+  docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}' || true
+fi
 
-main() {
-    log_info "=========================================="
-    log_info "VPS Auto Restore Script Started"
-    log_info "=========================================="
-    
-    # Validate configuration
-    if ! validate_backup_items; then
-        log_error "Backup items validation failed"
-        exit 1
-    fi
-    
-    if ! validate_backup_dir; then
-        log_error "Backup directory validation failed"
-        exit 1
-    fi
-    
-    # Find backup to restore
-    local backup_file=""
-    if [[ $# -eq 1 ]]; then
-        if ! backup_file=$(find_backup_by_date "$1"); then
-            log_error "Failed to find backup for date: $1"
-            exit 1
-        fi
-    else
-        if ! backup_file=$(find_latest_backup); then
-            log_error "Failed to find latest backup"
-            exit 1
-        fi
-    fi
-    
-    # Validate tar content before proceeding
-    if ! validate_tar_content "${backup_file}"; then
-        log_error "Backup validation failed. Aborting restore operation."
-        exit 1
-    fi
-    
-    # Stop services
-    stop_services
-    
-    # Extract backup
-    if ! extract_backup "${backup_file}"; then
-        log_error "Backup extraction failed. Attempting to restart services..."
-        start_services
-        exit 1
-    fi
-    
-    # Start services
-    start_services
-    
-    # Cleanup tarball
-    if ! cleanup_tarball "${backup_file}"; then
-        log_warn "Tarball cleanup failed, but restore completed successfully"
-    fi
-    
-    log_info "=========================================="
-    log_info "VPS Auto Restore Completed Successfully"
-    log_info "=========================================="
-    return 0
-}
-
-# Execute main function
-main "$@"
+log "RESTORE DONE."
+log "Safety tar (local): $PRE_TAR"

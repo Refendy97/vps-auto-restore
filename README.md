@@ -8,22 +8,25 @@ Script otomatis untuk restore VPN Marzban, Nginx, dan Bot di VPS dengan mudah.
 
 ### 1️⃣ Install dependency (AUTO)
 ```bash
-apt update
 apt install -y \
-  curl \
-  ca-certificates \
-  tar \
-  docker.io \
-  docker-compose-plugin \
-  docker-compose \
+  curl ca-certificates tar unzip cron \
+  iptables iproute2 net-tools \
+  openssl coreutils \
+  docker.io docker-compose-plugin docker-compose \
+  nginx \
+  python3 python3-venv python3-pip \
   rclone
 ```
-
-### 2️⃣ Ambil script restore dari GitHub
+### Aktifkan docker & nginx:
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Refendy97/vps-auto-restore/main/restore.sh \
-  -o /usr/local/bin/vpn-restore
-chmod +x /usr/local/bin/vpn-restore
+systemctl enable --now docker
+systemctl enable --now nginx
+```
+
+
+### 2️⃣ Ambil script install.sh dari GitHub
+```bash
+curl -fsSL https://raw.githubusercontent.com/Refendy97/vps-auto-restore/main/install.sh | bash
 ```
 
 ### 3️⃣ Jalankan restore penuh
@@ -52,7 +55,7 @@ vpn-restore --yes
 
 ### ▶️ Restore backup TANGGAL TERTENTU
 ```bash
-vpn-restore --backup vpn-backup-YYYY-MM-DD.tar.gz --yes
+vpn-restore YYYY-MM-DD --yes
 ```
 
 ---
@@ -77,10 +80,10 @@ systemctl restart budivpn-bot
 
 ## ✅ PERINTAH PENTING
 ```bash
-backup
+vpn-backup
 vpn-restore --dry-run
 vpn-restore --yes
-vpn-restore --backup vpn-backup-YYYY-MM-DD.tar.gz --yes
+vpn-backup-YYYY-MM-DD --yes
 ```
 
 ---
